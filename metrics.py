@@ -1,304 +1,174 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple, Callable, Dict
+from typing import Dict, List, Sequence, Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .generate_long import InnovationSpan, _pick_target_cluster
-from .az_mcts import build_ngram_set, _kl_divergence  # type: ignore
-from .models import ValueHead
-
-@torch.no_grad()
-def _forward_last(lm, seq: List[int], device: str, max_ctx: int, output_hidden: bool = False):
-    seq_ctx = seq[-max_ctx:]
-    x = torch.tensor(seq_ctx, dtype=torch.long, device=device)[None, :]
-    out = lm(
-        input_ids=x,
-        attention_mask=None,
-        labels=None,
-        output_hidden_states=bool(output_hidden),
-        return_dict=True,
-    )
-    logits_last = out.logits[0, -1]
-    logp_raw = F.log_softmax(logits_last, dim=-1)
-    hidden_last = out.hidden_states[-1][0, -1] if output_hidden else None
-    return logits_last, logp_raw, hidden_last
-
-def _sample_from_scores(scores: torch.Tensor, top_k: int, temperature: float, rng: np.random.Generator) -> int:
-    scores = scores / max(1e-6, float(temperature))
-    if 0 < int(top_k) < scores.numel():
-        v, idx = torch.topk(scores, k=int(top_k))
-        p = torch.softmax(v, dim=-1)
-        j = int(rng.choice(np.arange(int(top_k)), p=p.detach().cpu().numpy()))
-        return int(idx[j].item())
-    p = torch.softmax(scores, dim=-1)
-    j = int(rng.choice(np.arange(scores.numel()), p=p.detach().cpu().numpy()))
-    return int(j)
-
-@torch.no_grad()
-def sample_step(
+def compute_surprise_threshold(
+    surpr_lists: Sequence[Sequence[float]],
     *,
-    lm_sample,
-    lm_surpr,
-    seq: List[int],
-    device: str,
-    max_ctx: int,
-    temperature: float,
-    top_k: int,
-    rng: np.random.Generator,
-) -> Tuple[int, float]:
-    logits_s, _logp_raw_s, _ = _forward_last(lm_sample, seq, device, max_ctx, output_hidden=False)
-    # sampling distribution
-    logits_s = logits_s / max(1e-6, float(temperature))
-    tok = _sample_from_scores(logits_s, top_k=top_k, temperature=1.0, rng=rng)
+    q: float = 0.99,
+    clip_min: float = 1.0,
+    clip_max: float = 30.0,
+) -> float:
+    vals = []
+    for s in surpr_lists:
+        vals.extend([float(x) for x in s])
+    if not vals:
+        return float(clip_max)
+    th = float(np.quantile(np.array(vals, dtype=np.float32), q))
+    return float(np.clip(th, clip_min, clip_max))
 
-    # surpr always under lm_surpr (guided)
-    _logits_u, logp_raw_u, _ = _forward_last(lm_surpr, seq, device, max_ctx, output_hidden=False)
-    surpr = float(-float(logp_raw_u[int(tok)].item()))
-    return int(tok), float(surpr)
+@dataclass
+class SparkStats:
+    spark_rate: float
+    spark_in_span_ratio: float
+    spark_outside_span_rate: float
+    recovery_drop: float
+    recovery_steps: float
 
-@torch.no_grad()
-def contrastive_step(
+def spark_metrics(
+    surpr: Sequence[float],
+    spans: Sequence[Tuple[int,int]],
     *,
-    lm_expert,
-    lm_amateur,
-    lm_surpr,
-    seq: List[int],
-    device: str,
-    max_ctx: int,
-    alpha: float,
-    temperature: float,
-    top_k: int,
-    rng: np.random.Generator,
-) -> Tuple[int, float]:
-    logits_e, logp_raw_e, _ = _forward_last(lm_expert, seq, device, max_ctx, output_hidden=False)
-    logits_a, logp_raw_a, _ = _forward_last(lm_amateur, seq, device, max_ctx, output_hidden=False)
+    spark_th: float,
+    recovery_K: int,
+) -> SparkStats:
+    T = len(surpr)
+    is_spark = np.array([float(x) >= float(spark_th) for x in surpr], dtype=np.bool_)
+    total_sparks = int(is_spark.sum())
+    spark_rate = float(total_sparks / max(1, T))
 
-    # candidate set: top-k from expert temperatured logits
-    scores_e = logits_e / max(1e-6, float(temperature))
-    k = min(int(top_k), int(scores_e.numel()))
-    v, idx = torch.topk(scores_e, k=k)
+    # in-span mask
+    in_span = np.zeros((T,), dtype=np.bool_)
+    for a,b in spans:
+        a = max(0,int(a)); b = min(T,int(b))
+        if b> a:
+            in_span[a:b] = True
+    in_span_sparks = int((is_spark & in_span).sum())
+    spark_in_span_ratio = float(in_span_sparks / max(1, total_sparks))
 
-    # DExperts-style combination on log-probs (raw)
-    comb = logp_raw_e[idx] - float(alpha) * logp_raw_a[idx]
-    tok = int(idx[int(torch.argmax(comb).item())].item())  # deterministic by default
+    outT = int((~in_span).sum())
+    spark_outside_span_rate = float(int((is_spark & (~in_span)).sum()) / max(1, outT))
 
-    # Optional stochasticity: uncomment if you want
-    # tok = int(idx[_sample_from_scores(comb, top_k=k, temperature=1.0, rng=rng)].item())
-
-    # surpr always under guided (lm_surpr)
-    if lm_surpr is lm_expert:
-        surpr = float(-float(logp_raw_e[tok].item()))
-    else:
-        _logits_u, logp_raw_u, _ = _forward_last(lm_surpr, seq, device, max_ctx, output_hidden=False)
-        surpr = float(-float(logp_raw_u[tok].item()))
-    return tok, surpr
-
-def _repeat_penalty(seq: List[int], w_repeat1: float, w_repeat3: float) -> float:
-    pen = 0.0
-    if len(seq) >= 2 and seq[-1] == seq[-2]:
-        pen += float(w_repeat1)
-    if len(seq) >= 3:
-        last3 = tuple(seq[-3:])
-        for i in range(0, len(seq) - 3):
-            if tuple(seq[i : i + 3]) == last3:
-                pen += float(w_repeat3)
-                break
-    return float(pen)
-
-def _novelty_bonus(seq: List[int], ng2: set, ng3: set, w_novel2: float, w_novel3: float) -> float:
-    bonus = 0.0
-    if len(seq) >= 2 and tuple(seq[-2:]) not in ng2:
-        bonus += float(w_novel2)
-    if len(seq) >= 3 and tuple(seq[-3:]) not in ng3:
-        bonus += float(w_novel3)
-    return float(bonus)
-
-@torch.no_grad()
-def greedy_reward_rescore_step(
-    *,
-    lm_guided,
-    value_head: ValueHead,
-    p_data: np.ndarray,
-    kl_max: float,
-    ng2: set,
-    ng3: set,
-    seq: List[int],
-    device: str,
-    max_ctx: int,
-    target_cluster: int,
-    # reward weights
-    w_value: float,
-    w_novel2: float,
-    w_novel3: float,
-    w_repeat1: float,
-    w_repeat3: float,
-    w_kl_barrier: float,
-    # candidate selection
-    cand_topk: int = 48,
-) -> Tuple[int, float]:
-    # 1) get candidate tokens from guided logits
-    logits, logp_raw, _ = _forward_last(lm_guided, seq, device, max_ctx, output_hidden=False)
-    k = min(int(cand_topk), int(logits.numel()))
-    _, cand = torch.topk(logits, k=k)
-
-    # 2) batch forward for each candidate to get hidden_last AFTER appending cand
-    seq_ctx = seq[-max_ctx:]
-    # build batch: each is ctx + [cand]
-    B = int(cand.numel())
-    maxL = len(seq_ctx) + 1
-    x = torch.full((B, maxL), int(seq_ctx[0] if len(seq_ctx)>0 else 0), dtype=torch.long, device=device)
-    attn = torch.zeros((B, maxL), dtype=torch.long, device=device)
-    for i in range(B):
-        toks = seq_ctx + [int(cand[i].item())]
-        x[i, :len(toks)] = torch.tensor(toks, dtype=torch.long, device=device)
-        attn[i, :len(toks)] = 1
-
-    out = lm_guided(
-        input_ids=x,
-        attention_mask=attn,
-        labels=None,
-        output_hidden_states=True,
-        return_dict=True,
-    )
-    hs = out.hidden_states[-1]  # [B,T,H]
-    idx_last = attn.sum(dim=1).clamp(min=1) - 1
-    h_last = hs[torch.arange(B, device=device), idx_last]  # [B,H]
-
-    v_logits = value_head(h_last)  # [B,K]
-    p = torch.softmax(v_logits, dim=-1)  # [B,K]
-    v = p[:, int(target_cluster)]  # [B]
-
-    # KL barrier term
-    p_np = p.detach().cpu().numpy().astype(np.float32)
-    klv = np.array([_kl_divergence(p_np[i], p_data) for i in range(B)], dtype=np.float32)
-    kl_pen = float(w_kl_barrier) * np.maximum(0.0, klv - float(kl_max))  # [B]
-
-    # novelty / repeat (cheap)
-    seq_base = list(seq)
-    bonus = np.zeros((B,), dtype=np.float32)
-    rep = np.zeros((B,), dtype=np.float32)
-    for i in range(B):
-        s2 = seq_base + [int(cand[i].item())]
-        bonus[i] = float(_novelty_bonus(s2, ng2, ng3, w_novel2, w_novel3))
-        rep[i] = float(_repeat_penalty(s2, w_repeat1, w_repeat3))
-
-    # combine score: logp_raw (quality) + reward terms
-    score = logp_raw[cand] + float(w_value) * v.detach() + torch.tensor(bonus, device=device) - torch.tensor(rep, device=device) - torch.tensor(kl_pen, device=device)
-    best_i = int(torch.argmax(score).item())
-    tok = int(cand[best_i].item())
-
-    surpr = float(-float(logp_raw[int(tok)].item()))  # guided surpr
-    return tok, surpr
-
-@torch.no_grad()
-def beam_search_window(
-    *,
-    lm,
-    device: str,
-    prefix: List[int],
-    n_new: int,
-    max_ctx: int,
-    beam_size: int = 4,
-    cand_topk: int = 32,
-    length_penalty: float = 1.0,
-) -> Tuple[List[int], List[float]]:
-    """
-    Beam search for a fixed-length window.
-    Returns (new_tokens, new_surprs) relative to the prefix.
-    """
-    beams: List[Tuple[List[int], float, List[float]]] = [(list(prefix), 0.0, [])]  # (seq, logp, surprs)
-    for _t in range(int(n_new)):
-        all_cand = []
-        for seq, logp_acc, surprs in beams:
-            logits, logp_raw, _ = _forward_last(lm, seq, device, max_ctx, output_hidden=False)
-            k = min(int(cand_topk), int(logits.numel()))
-            top_logp, idx = torch.topk(logp_raw, k=k)  # use raw logp for beam
-            for j in range(k):
-                tok = int(idx[j].item())
-                lp = float(top_logp[j].item())
-                new_seq = seq + [tok]
-                new_logp = logp_acc + lp
-                new_surprs = surprs + [float(-lp)]
-                all_cand.append((new_seq, new_logp, new_surprs))
-
-        # rank beams
-        def score(item):
-            seq, logp_sum, _sur = item
-            L = max(1, len(seq) - len(prefix))
-            return logp_sum / (L ** float(length_penalty))
-        all_cand.sort(key=score, reverse=True)
-        beams = all_cand[: int(beam_size)]
-
-    best_seq, _best_logp, best_surprs = beams[0]
-    new_tokens = best_seq[len(prefix):]
-    return new_tokens, best_surprs
-
-@torch.no_grad()
-def generate_long_with_spans(
-    *,
-    lm_outside,
-    lm_inside,  # kept for symmetry (strategy can close over it)
-    lm_surpr,
-    device: str,
-    bos_id: int,
-    eos_id: int,
-    spans: Sequence[InnovationSpan],
-    total_new: int,
-    temperature: float,
-    top_k: int,
-    max_ctx: int,
-    seed: int,
-    inside_step_fn: Callable[..., Tuple[int, float]],
-    inside_kwargs: Dict,
-) -> Tuple[List[int], List[float]]:
-    """
-    Generic loop: outside spans uses sampling on lm_outside, inside spans uses `inside_step_fn`.
-    Surpr always measured under `lm_surpr` (you can also choose to use a different surpr model via your inside_step_fn).
-    """
-    rng = np.random.default_rng(seed)
-    spans = sorted(list(spans or []), key=lambda s: s.start)
-    span_i = 0
-    cur_span: Optional[InnovationSpan] = None
-
-    seq: List[int] = [int(bos_id)]
-    surprs: List[float] = []
-
-    for t in range(int(total_new)):
-        if cur_span is None and span_i < len(spans) and t >= spans[span_i].start:
-            cur_span = spans[span_i]
-            span_i += 1
-        if cur_span is not None and t >= cur_span.end:
-            cur_span = None
-
-        in_span = cur_span is not None
-        if not in_span:
-            tok, surpr = sample_step(
-                lm_sample=lm_outside,
-                lm_surpr=lm_surpr,
-                seq=seq,
-                device=device,
-                max_ctx=max_ctx,
-                temperature=temperature,
-                top_k=top_k,
-                rng=rng,
-            )
-            seq.append(int(tok))
-            surprs.append(float(surpr))
+    # recovery: after each spark, find minimum surpr within K steps; report avg drop and steps to get below th
+    drops = []
+    steps = []
+    for i in np.where(is_spark)[0].tolist():
+        jmax = min(T, i + 1 + int(recovery_K))
+        if jmax <= i+1:
+            continue
+        window = np.array(surpr[i+1:jmax], dtype=np.float32)
+        if window.size == 0:
+            continue
+        minv = float(window.min())
+        drops.append(float(surpr[i]) - minv)
+        below = np.where(window < float(spark_th))[0]
+        if below.size > 0:
+            steps.append(float(below[0] + 1))
         else:
-            tok, surpr = inside_step_fn(
-                seq=seq,
-                device=device,
-                max_ctx=max_ctx,
-                rng=rng,
-                **inside_kwargs,
-            )
-            seq.append(int(tok))
-            surprs.append(float(surpr))
+            steps.append(float(recovery_K))
+    recovery_drop = float(np.mean(drops)) if drops else 0.0
+    recovery_steps = float(np.mean(steps)) if steps else float(recovery_K)
+    return SparkStats(
+        spark_rate=spark_rate,
+        spark_in_span_ratio=spark_in_span_ratio,
+        spark_outside_span_rate=spark_outside_span_rate,
+        recovery_drop=recovery_drop,
+        recovery_steps=recovery_steps,
+    )
 
-        if int(eos_id) >= 0 and int(seq[-1]) == int(eos_id):
-            break
+def distinct_n(seq: Sequence[int], n: int, pad_id: int) -> float:
+    s = [int(x) for x in seq if int(x) != int(pad_id)]
+    if len(s) < n:
+        return 0.0
+    grams = [tuple(s[i:i+n]) for i in range(len(s)-n+1)]
+    return float(len(set(grams)) / max(1, len(grams)))
 
-    return seq, surprs
+def novelty_n(seq: Sequence[int], n: int, pad_id: int, train_ngrams: set) -> float:
+    s = [int(x) for x in seq if int(x) != int(pad_id)]
+    if len(s) < n:
+        return 0.0
+    grams = [tuple(s[i:i+n]) for i in range(len(s)-n+1)]
+    nov = sum(1 for g in grams if g not in train_ngrams)
+    return float(nov / max(1, len(grams)))
+
+def token_entropy(seq: Sequence[int], pad_id: int) -> float:
+    s = [int(x) for x in seq if int(x) != int(pad_id)]
+    if not s:
+        return 0.0
+    vals = np.array(s, dtype=np.int64)
+    hist = np.bincount(vals)
+    p = hist / hist.sum()
+    p = p[p > 0]
+    return float(-(p * np.log(p + 1e-12)).sum())
+
+def uniq_ratio(seq: Sequence[int], pad_id: int) -> float:
+    s = [int(x) for x in seq if int(x) != int(pad_id)]
+    if not s:
+        return 0.0
+    return float(len(set(s)) / len(s))
+
+def repeat_rate(seq: Sequence[int], n: int, pad_id: int) -> float:
+    s = [int(x) for x in seq if int(x) != int(pad_id)]
+    if len(s) < n:
+        return 0.0
+    grams = [tuple(s[i:i+n]) for i in range(len(s)-n+1)]
+    return float(1.0 - (len(set(grams)) / max(1, len(grams))))
+
+@torch.no_grad()
+def nll_per_seq(lm, seqs: List[List[int]], pad_id: int, device: str, max_ctx: int = 512, batch_size: int = 8) -> np.ndarray:
+    """
+    Returns per-seq average NLL under lm for next-token prediction, ignoring pad.
+    Uses cropping to max_ctx.
+    """
+    lm.eval()
+    out = []
+    for i in range(0, len(seqs), int(batch_size)):
+        batch = seqs[i:i+int(batch_size)]
+        # crop & pad
+        batch_ctx = [s[-max_ctx:] for s in batch]
+        L = max(len(s) for s in batch_ctx)
+        x = torch.full((len(batch_ctx), L), int(pad_id), dtype=torch.long, device=device)
+        attn = torch.zeros((len(batch_ctx), L), dtype=torch.long, device=device)
+        for j, s in enumerate(batch_ctx):
+            x[j,:len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+            attn[j,:len(s)] = 1
+        logits = lm(input_ids=x, attention_mask=attn, labels=None, return_dict=True).logits  # [B,L,V]
+        # shift
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = x[:, 1:].contiguous()
+        shift_mask = (shift_labels != int(pad_id)).float()
+        logp = F.log_softmax(shift_logits, dim=-1)
+        nll = -logp.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1) * shift_mask
+        per = nll.sum(dim=1) / shift_mask.sum(dim=1).clamp(min=1.0)
+        out.append(per.detach().cpu().numpy())
+    return np.concatenate(out, axis=0)
+
+@torch.no_grad()
+def cluster_probs_per_seq(lm_with_cluster_head, seqs: List[List[int]], pad_id: int, device: str, max_ctx: int = 512, batch_size: int = 16) -> np.ndarray:
+    """
+    Returns p(cluster|seq) per sequence using model.cluster_head(last_hidden).
+    Expects lm_with_cluster_head is GPT2WithClusterHead or equivalent.
+    """
+    lm_with_cluster_head.eval()
+    probs = []
+    for i in range(0, len(seqs), int(batch_size)):
+        batch = seqs[i:i+int(batch_size)]
+        batch_ctx = [s[-max_ctx:] for s in batch]
+        L = max(len(s) for s in batch_ctx)
+        x = torch.full((len(batch_ctx), L), int(pad_id), dtype=torch.long, device=device)
+        attn = torch.zeros((len(batch_ctx), L), dtype=torch.long, device=device)
+        for j, s in enumerate(batch_ctx):
+            x[j,:len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+            attn[j,:len(s)] = 1
+        out, c_logits = lm_with_cluster_head(x, attention_mask=attn, labels=None, output_hidden_states=True)
+        p = torch.softmax(c_logits, dim=-1).detach().cpu().numpy().astype(np.float32)
+        probs.append(p)
+    return np.concatenate(probs, axis=0)
+
+def entropy_from_probs(p: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    p = np.clip(p, eps, 1.0)
+    return -(p * np.log(p)).sum(axis=-1)
