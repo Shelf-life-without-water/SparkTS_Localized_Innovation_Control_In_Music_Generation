@@ -302,3 +302,4 @@ def generate_long_with_spans(
             break
 
     return seq, surprs
+
